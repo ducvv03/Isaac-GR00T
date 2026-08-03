@@ -45,6 +45,15 @@ class ServerConfig:
     device: str = "cuda"
     """Device to run the model on"""
 
+    trt_engine_path: str | None = None
+    """Path to a directory of TensorRT engines built by build_trt_pipeline.py. If set,
+    swaps the corresponding PyTorch components for TRT engines after loading the model.
+    Only used with --model-path (ignored for --dataset-path / ReplayPolicy)."""
+
+    trt_mode: str = "n17_full_pipeline"
+    """Which TRT engine subset to load when --trt-engine-path is set: 'n17_full_pipeline'
+    (ViT + LLM + action head, recommended), 'vit_llm_only', 'action_head', or 'dit_only'."""
+
     # Replay policy configs
     dataset_path: str | None = None
     """Path to the dataset for replay trajectory"""
@@ -77,6 +86,7 @@ def main(config: ServerConfig):
     print(f"  Device: {config.device}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
+    print(f"  TRT engine path: {config.trt_engine_path or '(none -- PyTorch eager)'}")
 
     # Create and start the server
     if config.model_path is not None:
@@ -89,6 +99,15 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
+        if config.trt_engine_path is not None:
+            deploy_dir = str(Path(__file__).resolve().parents[2] / "scripts" / "deployment")
+            if deploy_dir not in sys.path:
+                sys.path.insert(0, deploy_dir)
+            from trt_model_forward import setup_tensorrt_engines
+
+            print(f"  Loading TRT engines (mode={config.trt_mode})...")
+            setup_tensorrt_engines(policy, config.trt_engine_path, mode=config.trt_mode)
+            print("  TRT engines loaded.")
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
