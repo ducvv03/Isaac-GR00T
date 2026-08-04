@@ -12,6 +12,14 @@ The repo contains the model, training pipeline, evaluation harness, and deployme
 - **Build system:** setuptools (see `pyproject.toml`)
 - **CI:** internal GitLab CI (`.gitlab-ci.yml` + includes under `ci/`, not shipped to the public GitHub EA repo); public GitHub Actions (`.github/workflows/main.yml`) runs `ruff check`/`ruff format --check` and a build on Python 3.10 for every PR into `main`
 
+## Setup
+
+- The repo uses git submodules for benchmark deps (`external_dependencies/{LIBERO,SimplerEnv,robocasa,robocasa-gr1-tabletop-tasks}`); clone with `--recurse-submodules` or run `git submodule update --init --recursive`.
+- `git-lfs` is required for the parquet files under `demo_data/`.
+- Video decoding uses [`torchcodec`](https://github.com/pytorch/torchcodec) exclusively (requires FFmpeg); `decord`/`pyav` are not supported. On aarch64 (Thor, Orin), `torchcodec` is built from source during `install_deps.sh`.
+- If fine-tuning fails with `CUDA_HOME is unset`: run `scripts/deployment/dgpu/install_deps.sh` once, or `export CUDA_HOME=/usr/local/cuda`.
+- On CUDA 13.x (Thor, Spark, GB300): PyTorch 2.7 pins Triton 3.3.1, which doesn't recognize CUDA 13 — run `bash scripts/patch_triton_cuda13.sh` after install.
+
 ## Quick-start commands
 
 ```bash

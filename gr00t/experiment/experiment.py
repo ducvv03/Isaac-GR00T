@@ -228,6 +228,50 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+
+    # ===== GROOT DIT LORA PATCH =====
+    if os.environ.get("GROOT_DIT_LORA", "0") == "1":
+        from peft import LoraConfig, get_peft_model
+
+        action_head = getattr(model, "action_head", None)
+        if action_head is None:
+            raise RuntimeError("GROOT_DIT_LORA=1 but model.action_head was not found.")
+
+        dit = getattr(action_head, "model", None)
+        if dit is None:
+            raise RuntimeError("GROOT_DIT_LORA=1 but model.action_head.model was not found.")
+
+        for param in dit.parameters():
+            param.requires_grad = False
+
+        targets = os.environ.get(
+            "GROOT_DIT_LORA_TARGETS",
+            "to_q,to_k,to_v,to_out.0",
+        ).split(",")
+
+        lora_config = LoraConfig(
+            r=int(os.environ.get("GROOT_DIT_LORA_R", "4")),
+            lora_alpha=int(os.environ.get("GROOT_DIT_LORA_ALPHA", "8")),
+            lora_dropout=float(os.environ.get("GROOT_DIT_LORA_DROPOUT", "0.05")),
+            bias="none",
+            target_modules=targets,
+        )
+
+        action_head.model = get_peft_model(dit, lora_config)
+
+        # Keep diffusion branch in train mode.
+        action_head.tune_diffusion_model = True
+
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+
+        print("===== GROOT DIT LORA ENABLED =====")
+        print("LoRA target modules:", targets)
+        print("Trainable params:", trainable)
+        print("Total params:", total)
+        print("Trainable ratio:", trainable / total)
+    # ===== END GROOT DIT LORA PATCH =====
+
     train_dataset, eval_dataset = pipeline.return_dataset()
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()

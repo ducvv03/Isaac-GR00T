@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gr00t"
 version = "0.1.0"
-requires-python = "==3.10.*"
+requires-python = "==3.12.*"
 dependencies = [
     "albumentations==1.4.18",
     "huggingface-hub[cli]",
@@ -78,7 +78,9 @@ include = ["gr00t*"]
 [tool.uv]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.uv.sources]
