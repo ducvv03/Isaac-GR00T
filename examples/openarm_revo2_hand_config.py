@@ -15,11 +15,12 @@
 
 # Modality config for the openarm_revo2_follower_sim dataset at
 # /home/ws/data/sim/lerobot_v2_data_filtered/20260803/ -- differs from
-# examples/OpenArm/openarm_config.py in that the end effector is a full 6-joint
-# Revo2 dexterous hand per side (thumb metacarpal/proximal, index/middle/ring/pinky
-# proximal) instead of a single-joint gripper, and the dataset was recorded at
-# fps=20 (not 30). state/action layout confirmed against meta/modality.json
-# (identical across all 13 episode folders in that recording).
+# examples/OpenArm/openarm_config.py in that the "hand" key maps to a single
+# index_proximal joint per side (not a 1-joint gripper, but structurally
+# equivalent -- 1 scalar per hand), and the dataset was recorded at fps=20
+# (not 30). state/action layout: left_arm(7) + right_arm(7) + left_hand(1) +
+# right_hand(1) = 16 dims total, confirmed against meta/modality.json
+# (identical across all 13 episode folders in that recording as of 2026-08-04).
 
 from gr00t.configs.data.embodiment_configs import register_modality_config
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -44,8 +45,8 @@ openarm_revo2_hand_config = {
         modality_keys=[
             "left_arm",  # 7 joint positions, openarm_left_joint1..7
             "right_arm",  # 7 joint positions, openarm_right_joint1..7
-            "left_hand",  # 6 joint positions: thumb_metacarpal/proximal, index/middle/ring/pinky_proximal
-            "right_hand",  # 6 joint positions, mirrored
+            "left_hand",  # 1 joint position: left_index_proximal_joint
+            "right_hand",  # 1 joint position: right_index_proximal_joint
         ],
     ),
     # Action: 40-step prediction horizon (architectural max, Gr00tN1d7Config.action_horizon
@@ -72,7 +73,7 @@ openarm_revo2_hand_config = {
                 format=ActionFormat.DEFAULT,
             ),
             # Hands: ABSOLUTE = target joint position, same convention as grippers
-            # in openarm_config.py extended to all 6 finger joints per side.
+            # in openarm_config.py (single index_proximal joint per side here).
             ActionConfig(
                 rep=ActionRepresentation.ABSOLUTE,
                 type=ActionType.NON_EEF,
