@@ -16,9 +16,9 @@
 # limitations under the License.
 
 """
-State machine for the OpenArm lift/place demo on real hardware. Every phase
-is gated by Enter and stoppable early with 'q' (type it, then press Enter --
-this is line-buffered stdin, not raw single-keystroke input):
+State machine for the OpenArm lift/place demo on real hardware. 'q' means:
+type it, then press Enter -- this is line-buffered stdin, not raw
+single-keystroke input.
 
   HOME (0)
     |  [Enter]                          ['q' any time before Enter -> quit]
@@ -26,26 +26,27 @@ this is line-buffered stdin, not raw single-keystroke input):
   PREPARE move (prepare.csv)  --['q' during move]--> stop early, hold position
     |  [Enter]
     v
-  LIFT ("Lift...")            --['q' during LIFT]--> stop this phase
-    |  [Enter]
-    v
-  PLACE ("Place...")          --['q' during PLACE]--> stop this phase, exit
+  LIFT ("Lift...")   <--['q' during LIFT]--   switches to PLACE, no reconnect
+    |                                                                    ^
+    '--['q' during PLACE]--> switches back to LIFT, no reconnect --------'
+       (starts as PLACE ("Place..."))
 
-So the full sequence is: Enter -> move to prepare (q stops the move) ->
-Enter -> LIFT (q stops it) -> Enter -> PLACE (q stops it, program ends).
-'q' pressed while waiting for Enter (instead of pressing Enter) quits
-immediately without starting that phase. Ctrl+C works as a hard-stop at any
-point too.
+So the full sequence is: Enter -> move to prepare (q stops the move early) ->
+Enter -> LIFT starts -> 'q' switches to PLACE -> 'q' switches back to LIFT ->
+... looping forever between LIFT and PLACE on each 'q'. 'q' pressed while
+still waiting for Enter (instead of pressing Enter) quits immediately without
+starting that phase. The only way out of the LIFT/PLACE loop is Ctrl+C
+(works as a hard-stop at any point).
 
 State 1 (HOME -> PREPARE): streams interpolated trajectory_msgs/JointTrajectory
 commands (same topics/joint order as ros2_gr00t_client.py's real mode) from the
 zero/home pose through every waypoint in prepare.csv, at --prepare-command-hz.
 Precondition: the robot is actually at the zero/home pose when this starts.
 
-State 2 (LIFT, then PLACE): connects once to a running GR00T policy server
-(same as ros2_gr00t_client.py --mode real --no-hand) and keeps the connection
-and inference worker alive across both task phases -- only the live-mutable
-task instruction changes between them, no reconnect.
+State 2 (LIFT <-> PLACE toggle loop): connects once to a running GR00T policy
+server (same as ros2_gr00t_client.py --mode real --no-hand) and keeps the
+connection and inference worker alive for the whole loop -- only the
+live-mutable task instruction changes on each 'q', no reconnect.
 
 This file does NOT modify ros2_gr00t_client.py. It imports that file's reusable
 building blocks (OpenArmGr00tClientNode, request_action_chunk,
@@ -365,10 +366,11 @@ class Gr00tSession:
         self.inference_worker.start()
 
     def run_task_phase(self, task: str) -> None:
-        """Runs the control loop under `task` until 'q' is pressed. Returns
-        (does not quit the process) -- caller decides what happens next."""
+        """Runs the control loop under `task` until 'q' is pressed, then returns
+        (does not quit the process) -- caller decides what happens next (e.g.
+        immediately start the other task, for the LIFT<->PLACE toggle loop)."""
         self.task_state.set(task)
-        logger.info("STATE: running task=%r (press 'q' to stop this phase)", task)
+        logger.info("STATE: running task=%r (press 'q' to switch to the other task)", task)
         try:
             self.inference_queue.put_nowait(None)  # force a fresh inference under this task
         except queue.Full:
@@ -397,7 +399,7 @@ class Gr00tSession:
 
         while True:
             if check_quit_nonblocking():
-                logger.info("STATE: task=%r stopped by user (q).", task)
+                logger.info("STATE: task=%r stopped by user (q) -- switching.", task)
                 return
 
             just_swapped = False
@@ -505,11 +507,13 @@ def main() -> None:
         args.command_hz, args.inference_rate, args.swap_blend_duration,
     )
     try:
-        session.run_task_phase(LIFT_TASK)
-
-        if not wait_for_enter(f"\nPress Enter to start PLACE: {PLACE_TASK!r}, or 'q' to quit."):
-            return
-        session.run_task_phase(PLACE_TASK)
+        # LIFT <-> PLACE toggle loop: 'q' during either one stops it and
+        # immediately starts the other, looping forever (no reconnect, no
+        # separate Enter gate between them). Ctrl+C is the only way out.
+        task = LIFT_TASK
+        while True:
+            session.run_task_phase(task)
+            task = PLACE_TASK if task == LIFT_TASK else LIFT_TASK
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
