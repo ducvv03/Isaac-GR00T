@@ -16,26 +16,36 @@
 # limitations under the License.
 
 """
-State machine for the OpenArm lift/place demo on real hardware:
+State machine for the OpenArm lift/place demo on real hardware. Every phase
+is gated by Enter and stoppable early with 'q' (type it, then press Enter --
+this is line-buffered stdin, not raw single-keystroke input):
 
-  HOME (0) --[prepare.csv]--> PREPARE --[GR00T, task="Lift..."]--> LIFT
-                                                |
-                                     [Enter pressed] switches task
-                                                v
-                                              PLACE ("Place...")
+  HOME (0)
+    |  [Enter]                          ['q' any time before Enter -> quit]
+    v
+  PREPARE move (prepare.csv)  --['q' during move]--> stop early, hold position
+    |  [Enter]
+    v
+  LIFT ("Lift...")            --['q' during LIFT]--> stop this phase
+    |  [Enter]
+    v
+  PLACE ("Place...")          --['q' during PLACE]--> stop this phase, exit
 
-  ['q' pressed, during LIFT or PLACE] -> quits the control loop and shuts down.
+So the full sequence is: Enter -> move to prepare (q stops the move) ->
+Enter -> LIFT (q stops it) -> Enter -> PLACE (q stops it, program ends).
+'q' pressed while waiting for Enter (instead of pressing Enter) quits
+immediately without starting that phase. Ctrl+C works as a hard-stop at any
+point too.
 
 State 1 (HOME -> PREPARE): streams interpolated trajectory_msgs/JointTrajectory
 commands (same topics/joint order as ros2_gr00t_client.py's real mode) from the
 zero/home pose through every waypoint in prepare.csv, at --prepare-command-hz.
 Precondition: the robot is actually at the zero/home pose when this starts.
 
-State 2 (PREPARE -> LIFT -> PLACE): connects to a running GR00T policy server
-(same as ros2_gr00t_client.py --mode real --no-hand) and runs its control loop
-with a live-mutable task -- starts on the "Lift..." instruction and switches to
-"Place..." the instant you press Enter, with no restart or reconnect. Press 'q'
-at any point during LIFT or PLACE to quit cleanly.
+State 2 (LIFT, then PLACE): connects once to a running GR00T policy server
+(same as ros2_gr00t_client.py --mode real --no-hand) and keeps the connection
+and inference worker alive across both task phases -- only the live-mutable
+task instruction changes between them, no reconnect.
 
 This file does NOT modify ros2_gr00t_client.py. It imports that file's reusable
 building blocks (OpenArmGr00tClientNode, request_action_chunk,
@@ -59,6 +69,8 @@ import argparse
 import csv
 import logging
 import queue
+import select
+import sys
 import threading
 import time
 from pathlib import Path
@@ -88,6 +100,40 @@ LIFT_TASK = "Lift the silver-gray rectangular metal box with both hands and hold
 PLACE_TASK = "Place the silver-gray rectangular metal box back on the table with both hands."
 
 DEFAULT_PREPARE_CSV = Path(__file__).parent / "prepare.csv"
+
+
+# ============================================================================
+# stdin helpers -- shared by both states
+# ============================================================================
+
+
+def wait_for_enter(prompt: str) -> bool:
+    """Blocking wait for a line on stdin. Returns True on blank Enter (proceed),
+    False on 'q' (quit before starting). Other input is ignored, re-prompts."""
+    print(prompt)
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            return False
+        stripped = line.strip().lower()
+        if stripped == "q":
+            return False
+        if stripped == "":
+            return True
+        # ignore anything else and keep waiting
+
+
+def check_quit_nonblocking() -> bool:
+    """Non-blocking: True if a 'q' line is available on stdin right now. Safe to
+    call from inside a tight timed loop (publish loops, etc.) -- never blocks."""
+    while select.select([sys.stdin], [], [], 0)[0]:
+        line = sys.stdin.readline()
+        if line.strip().lower() == "q":
+            return True
+        # non-'q' input during a running phase is ignored; keep draining stdin
+        # in case more than one line queued up.
+    return False
 
 
 # ============================================================================
@@ -122,15 +168,20 @@ def _stream_segment(
     end: dict[str, np.ndarray],
     duration_s: float,
     command_hz: float,
-) -> None:
+) -> bool:
     """Linearly interpolate start -> end and stream single-point JointTrajectory
     commands at command_hz -- same streaming pattern as ros2_gr00t_client.py's
     publish_command_real (the arm controllers run interpolation_method: none and
-    expect a high-frequency command stream, not sparse waypoints)."""
+    expect a high-frequency command stream, not sparse waypoints).
+
+    Returns False (stopping mid-segment, holding the last published position) if
+    'q' was pressed; True if the segment completed."""
     n_substeps = max(1, round(duration_s * command_hz))
     dt = 1.0 / command_hz
     time_from_start = Duration(sec=0, nanosec=int(dt * 1e9))
     for sub in range(1, n_substeps + 1):
+        if check_quit_nonblocking():
+            return False
         loop_start = time.perf_counter()
         alpha = sub / n_substeps
         stamp = node.get_clock().now().to_msg()
@@ -148,18 +199,20 @@ def _stream_segment(
         sleep_time = dt - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
+    return True
 
 
 def move_to_prepare(csv_path: Path, duration_s: float, command_hz: float) -> None:
     """STATE: HOME -> PREPARE. Assumes the robot is currently at the zero/home
     pose (this script's precondition) and streams through every waypoint in
     prepare.csv, splitting duration_s evenly across all
-    home->row0->row1->...->row_last segments."""
+    home->row0->row1->...->row_last segments. Stops early (holding position)
+    if 'q' is pressed."""
     waypoints = load_prepare_waypoints(csv_path)
     if not waypoints:
         raise RuntimeError(f"No waypoints parsed from {csv_path}")
     logger.info(
-        "STATE HOME -> PREPARE: %d waypoints from %s over %.1fs",
+        "STATE HOME -> PREPARE: %d waypoints from %s over %.1fs (press 'q' to stop early)",
         len(waypoints), csv_path, duration_s,
     )
 
@@ -176,7 +229,9 @@ def move_to_prepare(csv_path: Path, duration_s: float, command_hz: float) -> Non
     time.sleep(0.5)  # let publishers connect before the first command
     try:
         for i in range(len(sequence) - 1):
-            _stream_segment(pubs, node, sequence[i], sequence[i + 1], segment_duration, command_hz)
+            if not _stream_segment(pubs, node, sequence[i], sequence[i + 1], segment_duration, command_hz):
+                logger.info("STATE HOME -> PREPARE: stopped early by user (q) at waypoint %d/%d", i, len(sequence) - 1)
+                return
             logger.info("  waypoint %d/%d reached", i + 1, len(sequence) - 1)
     finally:
         node.destroy_node()
@@ -185,7 +240,7 @@ def move_to_prepare(csv_path: Path, duration_s: float, command_hz: float) -> Non
 
 
 # ============================================================================
-# State 2: PREPARE -> LIFT -> (Enter) -> PLACE
+# State 2: LIFT, then PLACE (single connection, task changes between phases)
 # ============================================================================
 
 
@@ -248,146 +303,128 @@ def _inference_worker_loop(
             busy_event.clear()
 
 
-def run_lift_then_place(
-    host: str,
-    port: int,
-    no_hand: bool,
-    fps: float,
-    command_hz: float,
-    inference_rate: float,
-    swap_blend_duration: float,
-) -> None:
-    """STATE: PREPARE -> LIFT -> (Enter) -> PLACE. Real mode only. Mirrors
-    ros2_gr00t_client.py's real-mode control loop (see its run()), adapted for a
-    live-mutable task instead of a fixed one -- see module docstring for why
-    that needed a separate loop rather than reusing run() directly."""
-    rclpy.init()
-    node = OpenArmGr00tClientNode(mode="real", no_hand=no_hand)
-    spin_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
-    spin_thread.start()
+class Gr00tSession:
+    """Owns one policy-server connection + inference worker, reused across
+    multiple sequential task phases (LIFT, then PLACE) with no reconnect --
+    only run_task_phase()'s task argument changes between calls."""
 
-    logger.info("Connecting to policy server at %s:%d...", host, port)
-    policy_client = PolicyClient(host=host, port=port)
-    if not policy_client.ping():
-        raise RuntimeError(f"Server at {host}:{port} did not respond to ping()")
+    def __init__(self, host: str, port: int, no_hand: bool, fps: float, command_hz: float,
+                 inference_rate: float, swap_blend_duration: float):
+        self.fps = fps
+        self.command_hz = command_hz
+        self.inference_rate = inference_rate
+        self.swap_blend_duration = swap_blend_duration
 
-    modality_config = policy_client.get_modality_config()
-    action_keys = modality_config["action"].modality_keys
-    action_chunk_size = len(modality_config["action"].delta_indices)
-    lang_key = modality_config["language"].modality_keys[0]
+        rclpy.init()
+        self.node = OpenArmGr00tClientNode(mode="real", no_hand=no_hand)
+        self.spin_thread = threading.Thread(target=lambda: rclpy.spin(self.node), daemon=True)
+        self.spin_thread.start()
 
-    last_status_log = 0.0
-    while node.get_observation() is None:
-        now = time.perf_counter()
-        if now - last_status_log > 2.0:
-            logger.info("Waiting for full observation... %s", node.observation_status())
-            last_status_log = now
-        time.sleep(0.1)
-    first_obs = node.get_observation()
-    logger.info("STATE PREPARE -> LIFT: task=%r", LIFT_TASK)
+        logger.info("Connecting to policy server at %s:%d...", host, port)
+        self.policy_client = PolicyClient(host=host, port=port)
+        if not self.policy_client.ping():
+            raise RuntimeError(f"Server at {host}:{port} did not respond to ping()")
 
-    task_state = TaskState(LIFT_TASK)
-    inference_queue: queue.Queue = queue.Queue(maxsize=1)
-    result_queue: queue.Queue = queue.Queue(maxsize=1)
-    inference_stop_event = threading.Event()
-    inference_busy_event = threading.Event()
-    inference_worker = threading.Thread(
-        target=_inference_worker_loop,
-        args=(
-            policy_client,
-            node.get_observation,
-            lang_key,
-            task_state,
-            action_keys,
-            inference_queue,
-            result_queue,
-            inference_stop_event,
-            inference_busy_event,
-        ),
-        daemon=True,
-    )
-    inference_worker.start()
+        modality_config = self.policy_client.get_modality_config()
+        self.action_keys = modality_config["action"].modality_keys
+        self.action_chunk_size = len(modality_config["action"].delta_indices)
+        self.lang_key = modality_config["language"].modality_keys[0]
 
-    quit_event = threading.Event()
+        last_status_log = 0.0
+        while self.node.get_observation() is None:
+            now = time.perf_counter()
+            if now - last_status_log > 2.0:
+                logger.info("Waiting for full observation... %s", self.node.observation_status())
+                last_status_log = now
+            time.sleep(0.1)
+        first_obs = self.node.get_observation()
+        self.last_published_action: dict[str, np.ndarray] = {
+            key: first_obs["state"][key] for key in self.action_keys
+        }
 
-    def _stdin_listener() -> None:
-        """Runs for the whole GR00T-control phase (both LIFT and PLACE): blank
-        Enter switches task once (LIFT -> PLACE); 'q' at any point quits."""
-        switched = False
-        print(f"\nPress Enter to switch task to PLACE: {PLACE_TASK!r}, or 'q' to quit.\n")
-        while not quit_event.is_set():
-            try:
-                line = input()
-            except EOFError:
-                break
-            stripped = line.strip().lower()
-            if stripped == "q":
-                logger.info("Quit requested (q pressed).")
-                quit_event.set()
-                break
-            if stripped == "" and not switched:
-                switched = True
-                task_state.set(PLACE_TASK)
-                logger.info("STATE LIFT -> PLACE: task=%r (press 'q' to quit)", PLACE_TASK)
-                try:
-                    inference_queue.put_nowait(None)  # force a fresh inference under the new task
-                except queue.Full:
-                    pass
+        self.task_state = TaskState(LIFT_TASK)
+        self.inference_queue: queue.Queue = queue.Queue(maxsize=1)
+        self.result_queue: queue.Queue = queue.Queue(maxsize=1)
+        self.inference_stop_event = threading.Event()
+        self.inference_busy_event = threading.Event()
+        self.inference_worker = threading.Thread(
+            target=_inference_worker_loop,
+            args=(
+                self.policy_client,
+                self.node.get_observation,
+                self.lang_key,
+                self.task_state,
+                self.action_keys,
+                self.inference_queue,
+                self.result_queue,
+                self.inference_stop_event,
+                self.inference_busy_event,
+            ),
+            daemon=True,
+        )
+        self.inference_worker.start()
 
-    threading.Thread(target=_stdin_listener, daemon=True).start()
+    def run_task_phase(self, task: str) -> None:
+        """Runs the control loop under `task` until 'q' is pressed. Returns
+        (does not quit the process) -- caller decides what happens next."""
+        self.task_state.set(task)
+        logger.info("STATE: running task=%r (press 'q' to stop this phase)", task)
+        try:
+            self.inference_queue.put_nowait(None)  # force a fresh inference under this task
+        except queue.Full:
+            pass
 
-    cached_action_chunk: dict[str, np.ndarray] | None = None
-    action_chunk_index = 0
-    last_inference_time = 0.0
-    inference_interval = 1.0 / inference_rate
-    last_published_action: dict[str, np.ndarray] = {
-        key: first_obs["state"][key] for key in action_keys
-    }
-    command_dt = 1.0 / command_hz
-    substeps_per_action = max(1, round(command_hz / fps))
-    swap_substeps = max(1, round(command_hz * swap_blend_duration))
+        cached_action_chunk: dict[str, np.ndarray] | None = None
+        action_chunk_index = 0
+        last_inference_time = 0.0
+        inference_interval = 1.0 / self.inference_rate
+        command_dt = 1.0 / self.command_hz
+        substeps_per_action = max(1, round(self.command_hz / self.fps))
+        swap_substeps = max(1, round(self.command_hz * self.swap_blend_duration))
 
-    def publish_blended(start, end, n_substeps):
-        nonlocal last_published_action
-        for sub in range(1, n_substeps + 1):
-            sub_loop_start = time.perf_counter()
-            alpha = sub / n_substeps
-            node.publish_command_real(
-                blend_action_dicts(start, end, alpha, action_keys), dt=command_dt
-            )
-            elapsed = time.perf_counter() - sub_loop_start
-            sleep_time = command_dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-        last_published_action = end
+        def publish_blended(start, end, n_substeps):
+            for sub in range(1, n_substeps + 1):
+                sub_loop_start = time.perf_counter()
+                alpha = sub / n_substeps
+                self.node.publish_command_real(
+                    blend_action_dicts(start, end, alpha, self.action_keys), dt=command_dt
+                )
+                elapsed = time.perf_counter() - sub_loop_start
+                sleep_time = command_dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            self.last_published_action = end
 
-    try:
-        while not quit_event.is_set():
+        while True:
+            if check_quit_nonblocking():
+                logger.info("STATE: task=%r stopped by user (q).", task)
+                return
+
             just_swapped = False
             try:
-                new_chunk, inference_start_time = result_queue.get_nowait()
+                new_chunk, inference_start_time = self.result_queue.get_nowait()
                 inference_delay = time.perf_counter() - inference_start_time
                 action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, fps, action_chunk_size
+                    inference_delay, self.fps, self.action_chunk_size
                 )
                 cached_action_chunk = new_chunk
                 last_inference_time = time.perf_counter()
                 just_swapped = True
                 logger.info(
                     "New action chunk (latency=%.2fs, start_index=%d/%d)",
-                    inference_delay, action_chunk_index, action_chunk_size,
+                    inference_delay, action_chunk_index, self.action_chunk_size,
                 )
             except queue.Empty:
                 pass
 
             if should_trigger_new_inference(
                 cached_action_chunk is not None,
-                inference_busy_event.is_set(),
+                self.inference_busy_event.is_set(),
                 time.perf_counter() - last_inference_time,
                 inference_interval,
             ):
                 try:
-                    inference_queue.put_nowait(None)
+                    self.inference_queue.put_nowait(None)
                 except queue.Full:
                     pass
 
@@ -395,19 +432,18 @@ def run_lift_then_place(
                 time.sleep(0.05)
                 continue
 
-            action = {key: cached_action_chunk[key][action_chunk_index] for key in action_keys}
+            action = {
+                key: cached_action_chunk[key][action_chunk_index] for key in self.action_keys
+            }
             n_substeps = swap_substeps if just_swapped else substeps_per_action
-            publish_blended(last_published_action, action, n_substeps)
-            action_chunk_index = min(action_chunk_index + 1, action_chunk_size - 1)
-        if quit_event.is_set():
-            logger.info("Quitting.")
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    finally:
-        inference_stop_event.set()
-        inference_worker.join(timeout=1.0)
-        policy_client.close()
-        node.destroy_node()
+            publish_blended(self.last_published_action, action, n_substeps)
+            action_chunk_index = min(action_chunk_index + 1, self.action_chunk_size - 1)
+
+    def close(self) -> None:
+        self.inference_stop_event.set()
+        self.inference_worker.join(timeout=1.0)
+        self.policy_client.close()
+        self.node.destroy_node()
         rclpy.shutdown()
 
 
@@ -418,7 +454,7 @@ def run_lift_then_place(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="OpenArm lift/place state machine: HOME -> PREPARE -> LIFT -> (Enter) -> PLACE"
+        description="OpenArm lift/place state machine: Enter -> PREPARE -> Enter -> LIFT -> Enter -> PLACE, 'q' stops each phase"
     )
     parser.add_argument(
         "--prepare-csv", type=Path, default=DEFAULT_PREPARE_CSV,
@@ -458,16 +494,26 @@ def main() -> None:
     parser.add_argument("--swap-blend-duration", type=float, default=0.1, help="Chunk-swap blend seconds")
     args = parser.parse_args()
 
+    if not wait_for_enter("\nPress Enter to move HOME -> PREPARE, or 'q' to quit."):
+        return
     move_to_prepare(args.prepare_csv, args.prepare_duration, args.prepare_command_hz)
-    run_lift_then_place(
-        args.host,
-        args.port,
-        args.no_hand,
-        args.fps,
-        args.command_hz,
-        args.inference_rate,
-        args.swap_blend_duration,
+
+    if not wait_for_enter(f"\nPress Enter to start LIFT: {LIFT_TASK!r}, or 'q' to quit."):
+        return
+    session = Gr00tSession(
+        args.host, args.port, args.no_hand, args.fps,
+        args.command_hz, args.inference_rate, args.swap_blend_duration,
     )
+    try:
+        session.run_task_phase(LIFT_TASK)
+
+        if not wait_for_enter(f"\nPress Enter to start PLACE: {PLACE_TASK!r}, or 'q' to quit."):
+            return
+        session.run_task_phase(PLACE_TASK)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":
