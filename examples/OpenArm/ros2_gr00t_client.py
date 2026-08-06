@@ -105,6 +105,7 @@ STATE_JOINT_GROUPS = {
     "left_hand": ["left_index_proximal_joint"],
     "right_hand": ["right_index_proximal_joint"],
 }
+HAND_KEYS = ("left_hand", "right_hand")
 
 # All 6 Revo2 finger joints per hand, in URDF upper-limit order. GR00T's
 # left_hand/right_hand action is a single scalar (the trained index_proximal
@@ -125,7 +126,46 @@ NAMES_R_HAND = [f"right_{f}_joint" for f in HAND_FINGERS]
 # limits); every finger opens at 0.0.
 HAND_CLOSED = np.array([1.57, 1.03, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
 HAND_OPEN = np.zeros(len(HAND_FINGERS), dtype=np.float64)
+
+# 0.2 sits with clear margin below the recorded "closed/holding" floor (~0.35-0.41
+# in demo data) and clear margin above the "open" ceiling (~0.003-0.01) -- see
+# replay_ground_truth.py investigation. 0.3-0.4 range is NOT safe: recorded
+# closed-hold values commonly dip into it, which would flicker open/closed.
 HAND_CLOSE_THRESHOLD = 0.2
+
+# Frames the scalar action must stay below HAND_CLOSE_THRESHOLD before
+# publish_command() actually reports "open" (see HandDebouncer). At the
+# dataset's 20fps this is ~0.75s. Chosen from demo-data analysis: brief
+# sub-threshold dips during an otherwise continuous hold ran up to 15 frames
+# (likely sensor/actuation noise), while genuine open/release periods ran 23+
+# frames -- 15 filters the former without delaying the latter meaningfully.
+HAND_OPEN_DEBOUNCE_FRAMES = 15
+
+
+class HandDebouncer:
+    """Per-hand hysteresis over GR00T's single-scalar left_hand/right_hand action.
+
+    Closes immediately on any above-threshold reading (reacting fast to "close"
+    is safe). Only reports "open" after HAND_OPEN_DEBOUNCE_FRAMES consecutive
+    below-threshold readings, so a brief noisy dip during a continuous hold
+    doesn't cause a spurious release mid-lift.
+    """
+
+    def __init__(self, debounce_frames: int = HAND_OPEN_DEBOUNCE_FRAMES):
+        self._debounce_frames = debounce_frames
+        self._below_count = 0
+        self._is_open = False
+
+    def update(self, scalar: float) -> np.ndarray:
+        if scalar > HAND_CLOSE_THRESHOLD:
+            self._below_count = 0
+            self._is_open = False
+        else:
+            self._below_count += 1
+            if self._below_count >= self._debounce_frames:
+                self._is_open = True
+        return HAND_OPEN if self._is_open else HAND_CLOSED
+
 
 # Joints published on /joint_command. Arms pass GR00T's per-joint action
 # through unchanged; left_hand/right_hand expand from GR00T's single scalar
@@ -167,11 +207,20 @@ class OpenArmGr00tClientNode(Node):
     sensor reading. Commands for each arm are published as a one-point
     trajectory_msgs/JointTrajectory to that arm's joint_trajectory topic; nothing
     is published for the hands (no command topic exists yet for them).
+
+    no_hand=True: for checkpoints trained on an arms-only modality config (no
+    left_hand/right_hand keys at all, e.g. examples/openarm_revo2_arms_only_config.py
+    on real hardware data). Skips every hand-related read/seed/publish/self-feedback
+    step above entirely -- state, observation, and command all cover only
+    left_arm/right_arm. Required when running such a checkpoint: it never returns
+    "left_hand"/"right_hand" in its action dict, so the hand-handling code above
+    would KeyError without this flag.
     """
 
-    def __init__(self, mode: str = "sim"):
+    def __init__(self, mode: str = "sim", no_hand: bool = False):
         super().__init__("openarm_gr00t_client")
         self._mode = mode
+        self._no_hand = no_hand
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -181,7 +230,18 @@ class OpenArmGr00tClientNode(Node):
 
         self._lock = threading.Lock()
         self._images: dict[str, np.ndarray | None] = dict.fromkeys(CAMERA_TOPICS)
-        self._state: dict[str, np.ndarray | None] = dict.fromkeys(STATE_JOINT_GROUPS)
+        self._state_joint_groups = {
+            k: v for k, v in STATE_JOINT_GROUPS.items() if not (no_hand and k in HAND_KEYS)
+        }
+        self._command_joint_groups = {
+            k: v for k, v in COMMAND_JOINT_GROUPS.items() if not (no_hand and k in HAND_KEYS)
+        }
+        self._state: dict[str, np.ndarray | None] = dict.fromkeys(self._state_joint_groups)
+        self._hand_debouncers = (
+            {}
+            if no_hand
+            else {"left_hand": HandDebouncer(), "right_hand": HandDebouncer()}
+        )
 
         # Diagnostics only -- not used for control logic.
         self._image_msg_counts: dict[str, int] = {}
@@ -206,10 +266,11 @@ class OpenArmGr00tClientNode(Node):
             self.command_pub = self.create_publisher(JointState, JOINT_COMMAND_TOPIC, 10)
             self.get_logger().info(f"Publishing to: {JOINT_COMMAND_TOPIC}")
         else:
-            # No hand feedback in real mode -- seed with zero so
-            # get_observation() doesn't block on it forever.
-            self._state["left_hand"] = np.zeros(1, dtype=np.float32)
-            self._state["right_hand"] = np.zeros(1, dtype=np.float32)
+            if not no_hand:
+                # No hand feedback in real mode -- seed with zero so
+                # get_observation() doesn't block on it forever.
+                self._state["left_hand"] = np.zeros(1, dtype=np.float32)
+                self._state["right_hand"] = np.zeros(1, dtype=np.float32)
 
             for key, topic in CONTROLLER_STATE_TOPICS.items():
                 self.create_subscription(
@@ -246,7 +307,7 @@ class OpenArmGr00tClientNode(Node):
         try:
             positions = dict(zip(msg.name, msg.position, strict=False))
             state = {}
-            for key, joint_names in STATE_JOINT_GROUPS.items():
+            for key, joint_names in self._state_joint_groups.items():
                 missing = [n for n in joint_names if n not in positions]
                 if missing:
                     self.get_logger().warn(
@@ -310,15 +371,15 @@ class OpenArmGr00tClientNode(Node):
     def publish_command(self, action: dict[str, np.ndarray]) -> None:
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = [n for group in COMMAND_JOINT_GROUPS.values() for n in group]
+        msg.name = [n for group in self._command_joint_groups.values() for n in group]
         positions = []
-        for key in COMMAND_JOINT_GROUPS:
-            if key in ("left_hand", "right_hand"):
+        for key in self._command_joint_groups:
+            if key in HAND_KEYS:
                 # GR00T's action for this key is a single scalar (the trained
-                # index_proximal proxy) -- threshold it into a fully open/closed
+                # index_proximal proxy) -- debounce it into a fully open/closed
                 # command spanning all 6 real finger joints for this hand.
                 scalar = float(np.asarray(action[key], dtype=np.float64).reshape(-1)[0])
-                positions.append(HAND_CLOSED if scalar > HAND_CLOSE_THRESHOLD else HAND_OPEN)
+                positions.append(self._hand_debouncers[key].update(scalar))
             else:
                 positions.append(np.asarray(action[key], dtype=np.float64))
         msg.position = np.concatenate(positions).tolist()
@@ -336,6 +397,9 @@ class OpenArmGr00tClientNode(Node):
             point.time_from_start = time_from_start
             msg.points = [point]
             topic_pub.publish(msg)
+
+        if self._no_hand:
+            return
 
         # No real hand feedback exists -- feed GR00T's own predicted hand
         # action back in as next step's "current state" (self-referential).
@@ -453,7 +517,7 @@ def _inference_worker_loop(
 
 def run(args: argparse.Namespace) -> None:
     rclpy.init()
-    node = OpenArmGr00tClientNode(mode=args.mode)
+    node = OpenArmGr00tClientNode(mode=args.mode, no_hand=args.no_hand)
     spin_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
     spin_thread.start()
 
@@ -648,6 +712,15 @@ def main() -> None:
         help="'sim': /joint_states + flat /joint_command (Isaac Sim). "
         "'real': per-arm controller_state feedback + per-arm joint_trajectory commands "
         "(ros2_control on real hardware); hand has no real feedback in this mode.",
+    )
+    parser.add_argument(
+        "--no-hand",
+        action="store_true",
+        help="For checkpoints trained on an arms-only modality config (no left_hand/"
+        "right_hand keys, e.g. examples/openarm_revo2_arms_only_config.py). Skips all "
+        "hand state reading, seeding, self-referential feedback, and command "
+        "publishing -- required for such checkpoints, since they never return "
+        "left_hand/right_hand in their action dict.",
     )
     parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task instruction")
     parser.add_argument("--host", type=str, default="localhost", help="Policy server host")
