@@ -41,6 +41,12 @@ Usage:
         --model-path <finetuned-checkpoint-dir> \
         --embodiment-tag NEW_EMBODIMENT
 
+    python gr00t/eval/run_gr00t_server.py \
+    --model-path gr00t_openarm_revo2_arms_only_real_lora_5000_merged \
+    --embodiment-tag new_embodiment \
+    --trt-engine-path ./gr00t_trt_deployment_arms_only_real/engines \
+    --trt-mode n17_full_pipeline
+
     # Terminal 2: Isaac Sim, or the real OpenArm's ros2_control stack -- not part
     # of this repo.
 

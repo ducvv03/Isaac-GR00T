@@ -69,29 +69,29 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+from pathlib import Path
 import queue
 import select
 import sys
 import threading
 import time
-from pathlib import Path
+from typing import Callable
 
 from builtin_interfaces.msg import Duration
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from server_client import PolicyClient
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-
 from ros2_gr00t_client import (
-    OpenArmGr00tClientNode,
     STATE_JOINT_GROUPS,
     TRAJECTORY_COMMAND_TOPICS,
+    OpenArmGr00tClientNode,
     blend_action_dicts,
     calculate_latency_compensated_index,
     request_action_chunk,
     should_trigger_new_inference,
 )
+from server_client import PolicyClient
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
 logging.basicConfig(level=logging.INFO)
@@ -214,7 +214,9 @@ def move_to_prepare(csv_path: Path, duration_s: float, command_hz: float) -> Non
         raise RuntimeError(f"No waypoints parsed from {csv_path}")
     logger.info(
         "STATE HOME -> PREPARE: %d waypoints from %s over %.1fs (press 'q' to stop early)",
-        len(waypoints), csv_path, duration_s,
+        len(waypoints),
+        csv_path,
+        duration_s,
     )
 
     home = {"left_arm": np.zeros(7, dtype=np.float64), "right_arm": np.zeros(7, dtype=np.float64)}
@@ -230,8 +232,14 @@ def move_to_prepare(csv_path: Path, duration_s: float, command_hz: float) -> Non
     time.sleep(0.5)  # let publishers connect before the first command
     try:
         for i in range(len(sequence) - 1):
-            if not _stream_segment(pubs, node, sequence[i], sequence[i + 1], segment_duration, command_hz):
-                logger.info("STATE HOME -> PREPARE: stopped early by user (q) at waypoint %d/%d", i, len(sequence) - 1)
+            if not _stream_segment(
+                pubs, node, sequence[i], sequence[i + 1], segment_duration, command_hz
+            ):
+                logger.info(
+                    "STATE HOME -> PREPARE: stopped early by user (q) at waypoint %d/%d",
+                    i,
+                    len(sequence) - 1,
+                )
                 return
             logger.info("  waypoint %d/%d reached", i + 1, len(sequence) - 1)
     finally:
@@ -309,8 +317,16 @@ class Gr00tSession:
     multiple sequential task phases (LIFT, then PLACE) with no reconnect --
     only run_task_phase()'s task argument changes between calls."""
 
-    def __init__(self, host: str, port: int, no_hand: bool, fps: float, command_hz: float,
-                 inference_rate: float, swap_blend_duration: float):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        no_hand: bool,
+        fps: float,
+        command_hz: float,
+        inference_rate: float,
+        swap_blend_duration: float,
+    ):
         self.fps = fps
         self.command_hz = command_hz
         self.inference_rate = inference_rate
@@ -365,12 +381,23 @@ class Gr00tSession:
         )
         self.inference_worker.start()
 
-    def run_task_phase(self, task: str) -> None:
-        """Runs the control loop under `task` until 'q' is pressed, then returns
-        (does not quit the process) -- caller decides what happens next (e.g.
-        immediately start the other task, for the LIFT<->PLACE toggle loop)."""
+    def run_task_phase(
+        self,
+        task: str,
+        should_switch: Callable[[], bool] | None = None,
+        switch_trigger_desc: str = "press 'q' to switch to the other task",
+    ) -> None:
+        """Runs the control loop under `task` until `should_switch()` returns
+        True, then returns (does not quit the process) -- caller decides what
+        happens next (e.g. immediately start the other task, for the
+        LIFT<->PLACE toggle loop). Defaults to check_quit_nonblocking (the
+        original 'q'-to-switch behavior); auto_state_machine.py passes a
+        joint-stability predicate instead, to switch with no keyboard input
+        at all."""
+        if should_switch is None:
+            should_switch = check_quit_nonblocking
         self.task_state.set(task)
-        logger.info("STATE: running task=%r (press 'q' to switch to the other task)", task)
+        logger.info("STATE: running task=%r (%s)", task, switch_trigger_desc)
         try:
             self.inference_queue.put_nowait(None)  # force a fresh inference under this task
         except queue.Full:
@@ -398,8 +425,8 @@ class Gr00tSession:
             self.last_published_action = end
 
         while True:
-            if check_quit_nonblocking():
-                logger.info("STATE: task=%r stopped by user (q) -- switching.", task)
+            if should_switch():
+                logger.info("STATE: task=%r finished (%s) -- switching.", task, switch_trigger_desc)
                 return
 
             just_swapped = False
@@ -414,7 +441,9 @@ class Gr00tSession:
                 just_swapped = True
                 logger.info(
                     "New action chunk (latency=%.2fs, start_index=%d/%d)",
-                    inference_delay, action_chunk_index, self.action_chunk_size,
+                    inference_delay,
+                    action_chunk_index,
+                    self.action_chunk_size,
                 )
             except queue.Empty:
                 pass
@@ -434,9 +463,7 @@ class Gr00tSession:
                 time.sleep(0.05)
                 continue
 
-            action = {
-                key: cached_action_chunk[key][action_chunk_index] for key in self.action_keys
-            }
+            action = {key: cached_action_chunk[key][action_chunk_index] for key in self.action_keys}
             n_substeps = swap_substeps if just_swapped else substeps_per_action
             publish_blended(self.last_published_action, action, n_substeps)
             action_chunk_index = min(action_chunk_index + 1, self.action_chunk_size - 1)
@@ -459,17 +486,23 @@ def main() -> None:
         description="OpenArm lift/place state machine: Enter -> PREPARE -> Enter -> LIFT -> Enter -> PLACE, 'q' stops each phase"
     )
     parser.add_argument(
-        "--prepare-csv", type=Path, default=DEFAULT_PREPARE_CSV,
+        "--prepare-csv",
+        type=Path,
+        default=DEFAULT_PREPARE_CSV,
         help="CSV of waypoints from home to prepare position",
     )
     parser.add_argument(
-        "--prepare-duration", type=float, default=8.0,
+        "--prepare-duration",
+        type=float,
+        default=8.0,
         help="Total seconds to move from home through prepare.csv to the prepare "
         "position. Not verified against real motion limits -- tune conservatively "
         "for your hardware before trusting this default.",
     )
     parser.add_argument(
-        "--prepare-command-hz", type=float, default=250.0,
+        "--prepare-command-hz",
+        type=float,
+        default=250.0,
         help="Publish rate for the HOME->PREPARE move (same rationale as "
         "ros2_gr00t_client.py's --command-hz: interpolation_method: none needs a "
         "high-frequency command stream).",
@@ -477,23 +510,32 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="localhost", help="Policy server host")
     parser.add_argument("--port", type=int, default=5555, help="Policy server port")
     parser.add_argument(
-        "--no-hand", dest="no_hand", action="store_true", default=True,
+        "--no-hand",
+        dest="no_hand",
+        action="store_true",
+        default=True,
         help="Arms-only checkpoint (default: on, matches "
         "examples/openarm_revo2_arms_only_config.py).",
     )
     parser.add_argument(
-        "--with-hand", dest="no_hand", action="store_false",
+        "--with-hand",
+        dest="no_hand",
+        action="store_false",
         help="Use if the server checkpoint actually has left_hand/right_hand "
         "(overrides the --no-hand default).",
     )
     parser.add_argument(
-        "--fps", type=float, default=20.0,
+        "--fps",
+        type=float,
+        default=20.0,
         help="Must match the checkpoint's training data fps (20 for the real "
         "arms-only dataset in openarm_revo2_arms_only_config.py).",
     )
     parser.add_argument("--command-hz", type=float, default=250.0, help="GR00T-phase publish rate")
     parser.add_argument("--inference-rate", type=float, default=2.0, help="Max get_action() Hz")
-    parser.add_argument("--swap-blend-duration", type=float, default=0.1, help="Chunk-swap blend seconds")
+    parser.add_argument(
+        "--swap-blend-duration", type=float, default=0.1, help="Chunk-swap blend seconds"
+    )
     args = parser.parse_args()
 
     if not wait_for_enter("\nPress Enter to move HOME -> PREPARE, or 'q' to quit."):
@@ -503,8 +545,13 @@ def main() -> None:
     if not wait_for_enter(f"\nPress Enter to start LIFT: {LIFT_TASK!r}, or 'q' to quit."):
         return
     session = Gr00tSession(
-        args.host, args.port, args.no_hand, args.fps,
-        args.command_hz, args.inference_rate, args.swap_blend_duration,
+        args.host,
+        args.port,
+        args.no_hand,
+        args.fps,
+        args.command_hz,
+        args.inference_rate,
+        args.swap_blend_duration,
     )
     try:
         # LIFT <-> PLACE toggle loop: 'q' during either one stops it and
