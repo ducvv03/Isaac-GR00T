@@ -35,6 +35,12 @@ OpenArm ROS2 <-> GR00T policy-server bridge. Supports two modes:
   index_proximal scalar into all 6 real finger joints per hand (see
   compute_hand_finger_positions).
 
+In --mode real, the physical "left" camera is mounted upside-down; the
+recorded training data was already corrected for this, so live frames from it
+are rotated 180 deg right after decoding (see CAMERAS_ROTATED_180 / _on_image)
+before being sent to the model. --mode sim is unaffected -- the Isaac Sim
+camera is not physically inverted.
+
 Runs under ROS2's system Python (rclpy), separate from this repo's .venv (which
 has torch/transformers and targets Python 3.10). Talks to a running
 `gr00t/eval/run_gr00t_server.py` over ZMQ via the standalone client in
@@ -93,6 +99,15 @@ CAMERA_TOPICS = {
     "left": "/cam_left/cam_left/color/image_raw",
     "right": "/cam_right/cam_right/color/image_raw",
 }
+
+# On the real robot, the physical left camera is mounted upside-down; the
+# training data was already corrected for this (frames rotated 180 deg before
+# being recorded into the dataset), so raw live frames from this camera must
+# get the same correction here before being sent to the model -- otherwise
+# inference sees upside-down "left" frames that don't match what the
+# checkpoint was trained on. --mode real only (see _on_image below) -- the
+# Isaac Sim camera is not physically inverted, so --mode sim must NOT rotate.
+CAMERAS_ROTATED_180 = {"left"}
 
 # ROS2 topics -- real mode (ros2_control joint_trajectory_controller, one per arm).
 CONTROLLER_STATE_TOPICS = {
@@ -362,6 +377,8 @@ class OpenArmGr00tClientNode(Node):
                     throttle_duration_sec=2.0,
                 )
                 return
+            if self._mode == "real" and cam_name in CAMERAS_ROTATED_180:
+                img = np.rot90(img, 2)
             with self._lock:
                 self._images[cam_name] = img.copy()
             self._image_msg_counts[cam_name] = self._image_msg_counts.get(cam_name, 0) + 1
