@@ -25,9 +25,15 @@ OpenArm ROS2 <-> GR00T policy-server bridge. Supports two modes:
   /right_joint_trajectory_controller/controller_state (control_msgs/JointTrajectoryControllerState),
   commands published as trajectory_msgs/JointTrajectory to
   /left_joint_trajectory_controller/joint_trajectory and
-  /right_joint_trajectory_controller/joint_trajectory. Hand has no real feedback
-  in this mode, so the hand "state" fed into the next observation is just
-  GR00T's own last predicted hand action (self-referential, no sensor involved).
+  /right_joint_trajectory_controller/joint_trajectory. With --with-hand, hand
+  state is likewise read from /left_revo2_hand_controller/controller_state and
+  /right_revo2_hand_controller/controller_state (real sensor feedback, just the
+  single index_proximal joint per side -- same scalar proxy the checkpoint was
+  trained on), and commands are published as trajectory_msgs/JointTrajectory to
+  /left_revo2_hand_controller/joint_trajectory and
+  /right_revo2_hand_controller/joint_trajectory, expanding GR00T's predicted
+  index_proximal scalar into all 6 real finger joints per hand (see
+  compute_hand_finger_positions).
 
 Runs under ROS2's system Python (rclpy), separate from this repo's .venv (which
 has torch/transformers and targets Python 3.10). Talks to a running
@@ -89,8 +95,6 @@ CAMERA_TOPICS = {
 }
 
 # ROS2 topics -- real mode (ros2_control joint_trajectory_controller, one per arm).
-# No hand feedback/command topic exists yet; hand is handled purely via
-# GR00T's own generated value, see OpenArmGr00tClientNode's real-mode docstring.
 CONTROLLER_STATE_TOPICS = {
     "left_arm": "/left_joint_trajectory_controller/controller_state",
     "right_arm": "/right_joint_trajectory_controller/controller_state",
@@ -98,6 +102,19 @@ CONTROLLER_STATE_TOPICS = {
 TRAJECTORY_COMMAND_TOPICS = {
     "left_arm": "/left_joint_trajectory_controller/joint_trajectory",
     "right_arm": "/right_joint_trajectory_controller/joint_trajectory",
+}
+
+# ROS2 topics -- real mode hand feedback/command (Revo2 hand controller, one per
+# side), only subscribed/published when no_hand=False. Feedback carries just the
+# single index_proximal joint (matches STATE_JOINT_GROUPS["left_hand"/"right_hand"]);
+# commands carry all 6 real finger joints (see compute_hand_finger_positions).
+HAND_CONTROLLER_STATE_TOPICS = {
+    "left_hand": "/left_revo2_hand_controller/controller_state",
+    "right_hand": "/right_revo2_hand_controller/controller_state",
+}
+HAND_TRAJECTORY_COMMAND_TOPICS = {
+    "left_hand": "/left_revo2_hand_controller/joint_trajectory",
+    "right_hand": "/right_revo2_hand_controller/joint_trajectory",
 }
 
 # Joint names read from /joint_states, grouped to match
@@ -115,8 +132,8 @@ HAND_KEYS = ("left_hand", "right_hand")
 
 # All 6 Revo2 finger joints per hand, in URDF upper-limit order. GR00T's
 # left_hand/right_hand action is a single scalar (the trained index_proximal
-# proxy); publish_command() thresholds it into a fully open or fully closed
-# command spanning all 6 real finger joints per side.
+# proxy); compute_hand_finger_positions() expands it into all 6 real finger
+# joints per side, proportionally (see below).
 HAND_FINGERS = [
     "thumb_metacarpal",
     "thumb_proximal",
@@ -129,22 +146,63 @@ NAMES_L_HAND = [f"left_{f}_joint" for f in HAND_FINGERS]
 NAMES_R_HAND = [f"right_{f}_joint" for f in HAND_FINGERS]
 
 # Finger closed limits (rad), same order as HAND_FINGERS (revo2 URDF upper
-# limits); every finger opens at 0.0.
-HAND_CLOSED = np.array([1.57, 1.03, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
+# limits); every finger opens at 0.0. Doubles as the per-finger "max" that
+# compute_hand_finger_positions() scales against.
+HAND_CLOSED = np.array([0.0, 0.0, 0.4, 0.5, 0.6, 0.7], dtype=np.float64)
 HAND_OPEN = np.zeros(len(HAND_FINGERS), dtype=np.float64)
+
+
+def compute_hand_finger_positions(index_scalar: float) -> np.ndarray:
+    """Expand GR00T's single index_proximal scalar action into all 6 real
+    Revo2 finger-joint targets, in HAND_FINGERS order (thumb_metacarpal,
+    thumb_proximal, index_proximal, middle_proximal, ring_proximal,
+    pinky_proximal).
+
+    thumb_metacarpal/thumb_proximal are held at their HAND_CLOSED limits
+    always -- the checkpoint only proxies hand state/action through a single
+    index_proximal scalar, so there's no signal to drive an independent thumb
+    pose. index_proximal itself is the model's own prediction, clipped into
+    its valid [0, HAND_CLOSED[2]] range. middle/ring/pinky_proximal scale
+    proportionally with how closed index_proximal is (ratio = index_scalar /
+    HAND_CLOSED[2], the index finger's own closed limit), each capped at
+    their own HAND_CLOSED limit -- e.g. index_scalar=0.3 (of max 0.4) ->
+    ratio=0.75 -> middle=0.5*0.75, ring=0.6*0.75, pinky=0.7*0.75. All four
+    non-thumb fingers curl together, proportionally, instead of only index
+    moving.
+    """
+    index_max = HAND_CLOSED[2]  # index_proximal's own closed limit
+    ratio = float(np.clip(index_scalar / index_max, 0.0, 1.0))
+    return np.array(
+        [
+            HAND_CLOSED[0],  # thumb_metacarpal -- fixed
+            HAND_CLOSED[1],  # thumb_proximal -- fixed
+            ratio * HAND_CLOSED[2],  # index_proximal -- model's own prediction, clipped
+            ratio * HAND_CLOSED[3],  # middle_proximal
+            ratio * HAND_CLOSED[4],  # ring_proximal
+            ratio * HAND_CLOSED[5],  # pinky_proximal
+        ],
+        dtype=np.float64,
+    )
+
 
 # 0.2 sits with clear margin below the recorded "closed/holding" floor (~0.35-0.41
 # in demo data) and clear margin above the "open" ceiling (~0.003-0.01) -- see
 # replay_ground_truth.py investigation. 0.3-0.4 range is NOT safe: recorded
 # closed-hold values commonly dip into it, which would flicker open/closed.
+#
+# HandDebouncer/HAND_CLOSE_THRESHOLD/HAND_OPEN_DEBOUNCE_FRAMES are no longer used
+# by the live control path (publish_command/publish_command_real now use the
+# proportional compute_hand_finger_positions() above) -- kept only because
+# replay_ground_truth.py's ground-truth-replay diagnostic still imports
+# HandDebouncer for its binary open/closed playback.
 HAND_CLOSE_THRESHOLD = 0.2
 
 # Frames the scalar action must stay below HAND_CLOSE_THRESHOLD before
-# publish_command() actually reports "open" (see HandDebouncer). At the
-# dataset's 20fps this is ~0.75s. Chosen from demo-data analysis: brief
-# sub-threshold dips during an otherwise continuous hold ran up to 15 frames
-# (likely sensor/actuation noise), while genuine open/release periods ran 23+
-# frames -- 15 filters the former without delaying the latter meaningfully.
+# HandDebouncer actually reports "open". At the dataset's 20fps this is
+# ~0.75s. Chosen from demo-data analysis: brief sub-threshold dips during an
+# otherwise continuous hold ran up to 15 frames (likely sensor/actuation
+# noise), while genuine open/release periods ran 23+ frames -- 15 filters the
+# former without delaying the latter meaningfully.
 HAND_OPEN_DEBOUNCE_FRAMES = 15
 
 
@@ -204,20 +262,24 @@ class OpenArmGr00tClientNode(Node):
     mode="sim": state from /joint_states (all 4 modality groups from one message),
     commands published as a single flat JointState to /joint_command.
 
-    mode="real": arm state (left_arm, right_arm only) comes from the `feedback`
-    field of each arm's controller_state topic
-    (control_msgs/JointTrajectoryControllerState). There is no real hand
-    feedback, so left_hand/right_hand in self._state are seeded to zero at
-    startup and afterwards hold whatever GR00T itself last predicted for those
-    keys (set in publish_command_real) -- a self-referential stand-in, not a
-    sensor reading. Commands for each arm are published as a one-point
-    trajectory_msgs/JointTrajectory to that arm's joint_trajectory topic; nothing
-    is published for the hands (no command topic exists yet for them).
+    mode="real": arm state (left_arm, right_arm) comes from the `feedback` field
+    of each arm's controller_state topic (control_msgs/JointTrajectoryControllerState).
+    Commands for each arm are published as a one-point trajectory_msgs/JointTrajectory
+    to that arm's joint_trajectory topic.
+
+    no_hand=False (--with-hand) in real mode: hand state (left_hand, right_hand,
+    each the single index_proximal joint) comes from a real sensor too, the
+    `feedback` field of each hand's Revo2 controller_state topic -- same
+    mechanism as the arms, not self-referential. Commands are published as a
+    one-point trajectory_msgs/JointTrajectory per hand, expanding GR00T's
+    predicted index_proximal scalar into all 6 real finger joints via
+    compute_hand_finger_positions() (thumb fixed, middle/ring/pinky scale
+    proportionally with index).
 
     no_hand=True: for checkpoints trained on an arms-only modality config (no
     left_hand/right_hand keys at all, e.g. examples/openarm_revo2_arms_only_config.py
-    on real hardware data). Skips every hand-related read/seed/publish/self-feedback
-    step above entirely -- state, observation, and command all cover only
+    on real hardware data). Skips every hand-related subscribe/publish step
+    above entirely -- state, observation, and command all cover only
     left_arm/right_arm. Required when running such a checkpoint: it never returns
     "left_hand"/"right_hand" in its action dict, so the hand-handling code above
     would KeyError without this flag.
@@ -243,11 +305,6 @@ class OpenArmGr00tClientNode(Node):
             k: v for k, v in COMMAND_JOINT_GROUPS.items() if not (no_hand and k in HAND_KEYS)
         }
         self._state: dict[str, np.ndarray | None] = dict.fromkeys(self._state_joint_groups)
-        self._hand_debouncers = (
-            {}
-            if no_hand
-            else {"left_hand": HandDebouncer(), "right_hand": HandDebouncer()}
-        )
 
         # Diagnostics only -- not used for control logic.
         self._image_msg_counts: dict[str, int] = {}
@@ -272,26 +329,28 @@ class OpenArmGr00tClientNode(Node):
             self.command_pub = self.create_publisher(JointState, JOINT_COMMAND_TOPIC, 10)
             self.get_logger().info(f"Publishing to: {JOINT_COMMAND_TOPIC}")
         else:
+            state_topics = dict(CONTROLLER_STATE_TOPICS)
+            command_topics = dict(TRAJECTORY_COMMAND_TOPICS)
             if not no_hand:
-                # No hand feedback in real mode -- seed with zero so
-                # get_observation() doesn't block on it forever.
-                self._state["left_hand"] = np.zeros(1, dtype=np.float32)
-                self._state["right_hand"] = np.zeros(1, dtype=np.float32)
+                # Real hand feedback: same mechanism as the arms (a
+                # controller_state topic), not a self-referential seed.
+                state_topics.update(HAND_CONTROLLER_STATE_TOPICS)
+                command_topics.update(HAND_TRAJECTORY_COMMAND_TOPICS)
 
-            for key, topic in CONTROLLER_STATE_TOPICS.items():
+            for key, topic in state_topics.items():
                 self.create_subscription(
                     JointTrajectoryControllerState,
                     topic,
-                    lambda msg, arm_key=key: self._on_controller_state(msg, arm_key),
+                    lambda msg, group_key=key: self._on_controller_state(msg, group_key),
                     sensor_qos,
                 )
                 self.get_logger().info(f"Subscribed to '{key}' feedback: {topic}")
 
             self._trajectory_pubs = {
                 key: self.create_publisher(JointTrajectory, topic, 10)
-                for key, topic in TRAJECTORY_COMMAND_TOPICS.items()
+                for key, topic in command_topics.items()
             }
-            for key, topic in TRAJECTORY_COMMAND_TOPICS.items():
+            for key, topic in command_topics.items():
                 self.get_logger().info(f"Publishing '{key}' commands to: {topic}")
 
     def _on_image(self, msg: Image, cam_name: str) -> None:
@@ -329,27 +388,29 @@ class OpenArmGr00tClientNode(Node):
         except Exception:
             self.get_logger().error("_on_joint_state raised:", exc_info=True)
 
-    def _on_controller_state(self, msg: JointTrajectoryControllerState, arm_key: str) -> None:
+    def _on_controller_state(self, msg: JointTrajectoryControllerState, group_key: str) -> None:
+        """group_key is any STATE_JOINT_GROUPS key -- an arm (7 joints) or,
+        with --with-hand, a hand (1 joint: index_proximal)."""
         try:
             positions = dict(zip(msg.joint_names, msg.feedback.positions, strict=False))
-            joint_names = STATE_JOINT_GROUPS[arm_key]
+            joint_names = STATE_JOINT_GROUPS[group_key]
             missing = [n for n in joint_names if n not in positions]
             if missing:
                 self.get_logger().warn(
-                    f"[{arm_key}] controller_state missing {missing}; "
+                    f"[{group_key}] controller_state missing {missing}; "
                     f"msg.joint_names={list(msg.joint_names)}, "
                     f"len(feedback.positions)={len(msg.feedback.positions)}",
                     throttle_duration_sec=2.0,
                 )
-                return  # wait for a controller_state message that reports all 7 joints
+                return  # wait for a controller_state message that reports every joint
             state = np.array([positions[n] for n in joint_names], dtype=np.float32)
             with self._lock:
-                self._state[arm_key] = state
-            self._controller_state_msg_counts[arm_key] = (
-                self._controller_state_msg_counts.get(arm_key, 0) + 1
+                self._state[group_key] = state
+            self._controller_state_msg_counts[group_key] = (
+                self._controller_state_msg_counts.get(group_key, 0) + 1
             )
         except Exception:
-            self.get_logger().error(f"_on_controller_state('{arm_key}') raised:", exc_info=True)
+            self.get_logger().error(f"_on_controller_state('{group_key}') raised:", exc_info=True)
 
     def observation_status(self) -> str:
         """Human-readable snapshot of what's blocking get_observation(), for diagnostics."""
@@ -382,36 +443,37 @@ class OpenArmGr00tClientNode(Node):
         for key in self._command_joint_groups:
             if key in HAND_KEYS:
                 # GR00T's action for this key is a single scalar (the trained
-                # index_proximal proxy) -- debounce it into a fully open/closed
+                # index_proximal proxy) -- expand it proportionally into a
                 # command spanning all 6 real finger joints for this hand.
                 scalar = float(np.asarray(action[key], dtype=np.float64).reshape(-1)[0])
-                positions.append(self._hand_debouncers[key].update(scalar))
+                positions.append(compute_hand_finger_positions(scalar))
             else:
                 positions.append(np.asarray(action[key], dtype=np.float64))
         msg.position = np.concatenate(positions).tolist()
         self.command_pub.publish(msg)
 
     def publish_command_real(self, action: dict[str, np.ndarray], dt: float) -> None:
+        """Arms: GR00T's per-joint action published as-is (7 joints). Hands (if
+        not self._no_hand): GR00T's single index_proximal scalar expanded into
+        all 6 real finger joints via compute_hand_finger_positions() -- see
+        class docstring."""
         stamp = self.get_clock().now().to_msg()
         time_from_start = Duration(sec=0, nanosec=int(dt * 1e9))
-        for arm_key, topic_pub in self._trajectory_pubs.items():
+        for key, topic_pub in self._trajectory_pubs.items():
             msg = JointTrajectory()
             msg.header.stamp = stamp
-            msg.joint_names = STATE_JOINT_GROUPS[arm_key]
+            if key in HAND_KEYS:
+                scalar = float(np.asarray(action[key], dtype=np.float64).reshape(-1)[0])
+                msg.joint_names = NAMES_L_HAND if key == "left_hand" else NAMES_R_HAND
+                point_positions = compute_hand_finger_positions(scalar).tolist()
+            else:
+                msg.joint_names = STATE_JOINT_GROUPS[key]
+                point_positions = np.asarray(action[key], dtype=np.float64).tolist()
             point = JointTrajectoryPoint()
-            point.positions = np.asarray(action[arm_key], dtype=np.float64).tolist()
+            point.positions = point_positions
             point.time_from_start = time_from_start
             msg.points = [point]
             topic_pub.publish(msg)
-
-        if self._no_hand:
-            return
-
-        # No real hand feedback exists -- feed GR00T's own predicted hand
-        # action back in as next step's "current state" (self-referential).
-        with self._lock:
-            self._state["left_hand"] = np.asarray(action["left_hand"], dtype=np.float32)
-            self._state["right_hand"] = np.asarray(action["right_hand"], dtype=np.float32)
 
 
 def request_action_chunk(
@@ -717,16 +779,16 @@ def main() -> None:
         default="sim",
         help="'sim': /joint_states + flat /joint_command (Isaac Sim). "
         "'real': per-arm controller_state feedback + per-arm joint_trajectory commands "
-        "(ros2_control on real hardware); hand has no real feedback in this mode.",
+        "(ros2_control on real hardware); unless --no-hand is passed, hand "
+        "feedback/commands use the same mechanism via the Revo2 hand controller topics.",
     )
     parser.add_argument(
         "--no-hand",
         action="store_true",
         help="For checkpoints trained on an arms-only modality config (no left_hand/"
         "right_hand keys, e.g. examples/openarm_revo2_arms_only_config.py). Skips all "
-        "hand state reading, seeding, self-referential feedback, and command "
-        "publishing -- required for such checkpoints, since they never return "
-        "left_hand/right_hand in their action dict.",
+        "hand state reading and command publishing -- required for such checkpoints, "
+        "since they never return left_hand/right_hand in their action dict.",
     )
     parser.add_argument("--task", type=str, default=DEFAULT_TASK, help="Task instruction")
     parser.add_argument("--host", type=str, default="localhost", help="Policy server host")

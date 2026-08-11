@@ -44,9 +44,13 @@ zero/home pose through every waypoint in prepare.csv, at --prepare-command-hz.
 Precondition: the robot is actually at the zero/home pose when this starts.
 
 State 2 (LIFT <-> PLACE toggle loop): connects once to a running GR00T policy
-server (same as ros2_gr00t_client.py --mode real --no-hand) and keeps the
-connection and inference worker alive for the whole loop -- only the
-live-mutable task instruction changes on each 'q', no reconnect.
+server (same as ros2_gr00t_client.py --mode real, --no-hand or --with-hand)
+and keeps the connection and inference worker alive for the whole loop -- only
+the live-mutable task instruction changes on each 'q', no reconnect. With
+--with-hand, real Revo2 hand feedback/commands flow the same way as the arms
+(see OpenArmGr00tClientNode / compute_hand_finger_positions in
+ros2_gr00t_client.py) -- no client changes needed here, this file only forwards
+--no-hand/--with-hand through to Gr00tSession.
 
 This file does NOT modify ros2_gr00t_client.py. It imports that file's reusable
 building blocks (OpenArmGr00tClientNode, request_action_chunk,
@@ -56,8 +60,10 @@ implements its own control loop with a mutable task, since
 ros2_gr00t_client.py's task is a fixed string closed over by its inference
 worker thread at startup -- there is no existing way to change it live there.
 
-Prerequisite: a GR00T policy server already running on an arms-only checkpoint
-(e.g. examples/openarm_revo2_arms_only_config.py), matching --no-hand.
+Prerequisite: a GR00T policy server already running on a checkpoint matching
+--no-hand/--with-hand -- arms-only (examples/openarm_revo2_arms_only_config.py)
+for --no-hand, or hand-inclusive (examples/openarm_revo2_real_hand_config.py)
+for --with-hand.
 
 Usage:
     cd examples/OpenArm && source .venv-ros/bin/activate
@@ -521,8 +527,11 @@ def main() -> None:
         "--with-hand",
         dest="no_hand",
         action="store_false",
-        help="Use if the server checkpoint actually has left_hand/right_hand "
-        "(overrides the --no-hand default).",
+        help="Use with a hand-inclusive checkpoint (matches "
+        "examples/openarm_revo2_real_hand_config.py, overrides the --no-hand "
+        "default). Subscribes real Revo2 hand feedback and actuates the real "
+        "hand (see ros2_gr00t_client.py's --with-hand docs) -- not just a "
+        "self-referential loop.",
     )
     parser.add_argument(
         "--fps",
