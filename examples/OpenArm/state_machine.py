@@ -366,6 +366,7 @@ class Gr00tSession:
         }
 
         self.task_state = TaskState(LIFT_TASK)
+        self.task_stats: dict[str, dict[str, float]] = {}
         self.inference_queue: queue.Queue = queue.Queue(maxsize=1)
         self.result_queue: queue.Queue = queue.Queue(maxsize=1)
         self.inference_stop_event = threading.Event()
@@ -404,6 +405,7 @@ class Gr00tSession:
             should_switch = check_quit_nonblocking
         self.task_state.set(task)
         logger.info("STATE: running task=%r (%s)", task, switch_trigger_desc)
+        phase_start_time = time.perf_counter()
         try:
             self.inference_queue.put_nowait(None)  # force a fresh inference under this task
         except queue.Full:
@@ -432,6 +434,10 @@ class Gr00tSession:
 
         while True:
             if should_switch():
+                phase_duration = time.perf_counter() - phase_start_time
+                stats = self.task_stats.setdefault(task, {"count": 0, "total_time": 0.0})
+                stats["count"] += 1
+                stats["total_time"] += phase_duration
                 logger.info("STATE: task=%r finished (%s) -- switching.", task, switch_trigger_desc)
                 return
 
@@ -445,12 +451,6 @@ class Gr00tSession:
                 cached_action_chunk = new_chunk
                 last_inference_time = time.perf_counter()
                 just_swapped = True
-                logger.info(
-                    "New action chunk (latency=%.2fs, start_index=%d/%d)",
-                    inference_delay,
-                    action_chunk_index,
-                    self.action_chunk_size,
-                )
             except queue.Empty:
                 pass
 
@@ -473,6 +473,19 @@ class Gr00tSession:
             n_substeps = swap_substeps if just_swapped else substeps_per_action
             publish_blended(self.last_published_action, action, n_substeps)
             action_chunk_index = min(action_chunk_index + 1, self.action_chunk_size - 1)
+
+    def log_summary(self) -> None:
+        """Total number of times each task ran and its average completion
+        time (phase entry to 'q'/switch-trigger) -- logged once, right before
+        exit (see main()'s KeyboardInterrupt handler). A phase still running
+        when Ctrl+C hits is not counted (never reached its switch point)."""
+        total_count = sum(s["count"] for s in self.task_stats.values())
+        logger.info("=== Task summary (total runs=%d) ===", total_count)
+        for task, stats in self.task_stats.items():
+            avg = stats["total_time"] / stats["count"] if stats["count"] else 0.0
+            logger.info(
+                "  task=%r: completed=%d, avg_completion_time=%.2fs", task, stats["count"], avg
+            )
 
     def close(self) -> None:
         self.inference_stop_event.set()
@@ -572,6 +585,7 @@ def main() -> None:
             task = PLACE_TASK if task == LIFT_TASK else LIFT_TASK
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        session.log_summary()
     finally:
         session.close()
 

@@ -99,6 +99,7 @@ class SyncGr00tSession:
         self.command_hz = command_hz
         self.swap_blend_duration = swap_blend_duration
         self.steps_per_chunk = steps_per_chunk
+        self.task_stats: dict[str, dict[str, float]] = {}
 
         rclpy.init()
         self.node = OpenArmGr00tClientNode(mode="real", no_hand=no_hand)
@@ -139,6 +140,13 @@ class SyncGr00tSession:
         if should_switch is None:
             should_switch = check_quit_nonblocking
         logger.info("STATE: running task=%r (%s)", task, switch_trigger_desc)
+        phase_start_time = time.perf_counter()
+
+        def record_completion() -> None:
+            duration = time.perf_counter() - phase_start_time
+            stats = self.task_stats.setdefault(task, {"count": 0, "total_time": 0.0})
+            stats["count"] += 1
+            stats["total_time"] += duration
 
         command_dt = 1.0 / self.command_hz
         substeps_per_action = max(1, round(self.command_hz / self.fps))
@@ -160,6 +168,7 @@ class SyncGr00tSession:
 
         while True:
             if should_switch():
+                record_completion()
                 logger.info("STATE: task=%r finished (%s) -- switching.", task, switch_trigger_desc)
                 return
 
@@ -168,18 +177,13 @@ class SyncGr00tSession:
                 time.sleep(0.01)
                 continue
 
-            t0 = time.perf_counter()
             action_chunk = request_action_chunk(
                 self.policy_client, obs, self.lang_key, task, self.action_keys
-            )
-            logger.info(
-                "Got action chunk in %.2fs -- executing %d steps before next inference",
-                time.perf_counter() - t0,
-                steps_this_chunk,
             )
 
             for step in range(steps_this_chunk):
                 if should_switch():
+                    record_completion()
                     logger.info(
                         "STATE: task=%r finished mid-chunk (%s) -- switching.",
                         task,
@@ -189,6 +193,19 @@ class SyncGr00tSession:
                 action = {key: action_chunk[key][step] for key in self.action_keys}
                 n_substeps = swap_substeps if step == 0 else substeps_per_action
                 publish_blended(self.last_published_action, action, n_substeps)
+
+    def log_summary(self) -> None:
+        """Total number of times each task ran and its average completion
+        time (phase entry to 'q'/switch-trigger) -- logged once, right before
+        exit (see main()'s KeyboardInterrupt handler). A phase still running
+        when Ctrl+C hits is not counted (never reached its switch point)."""
+        total_count = sum(s["count"] for s in self.task_stats.values())
+        logger.info("=== Task summary (total runs=%d) ===", total_count)
+        for task, stats in self.task_stats.items():
+            avg = stats["total_time"] / stats["count"] if stats["count"] else 0.0
+            logger.info(
+                "  task=%r: completed=%d, avg_completion_time=%.2fs", task, stats["count"], avg
+            )
 
     def close(self) -> None:
         self.policy_client.close()
@@ -287,6 +304,7 @@ def main() -> None:
             task = PLACE_TASK if task == LIFT_TASK else LIFT_TASK
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        session.log_summary()
     finally:
         session.close()
 

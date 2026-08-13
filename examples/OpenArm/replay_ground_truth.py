@@ -29,12 +29,18 @@ looks wrong, the bug is in the mapping/publish code, not the model.
 for the 16-dim sim dataset (e.g. openarm_revo2_hand_config.py).
 
 --mode real: publishes trajectory_msgs/JointTrajectory to
-TRAJECTORY_COMMAND_TOPICS, arms only (left_arm/right_arm, no hand -- the real
-dataset has no hand state at all, see openarm_revo2_arms_only_config.py).
-Interpolates between consecutive recorded rows and streams at --command-hz,
-same reasoning as ros2_gr00t_client.py's --command-hz: the real arm
-controllers run interpolation_method: none and expect a high-frequency
-command stream, not sparse waypoints at the dataset's native --fps.
+TRAJECTORY_COMMAND_TOPICS, arms only by default (left_arm/right_arm, 14-dim,
+see openarm_revo2_arms_only_config.py) -- pass --with-hand for 16-dim
+episodes that also have left_hand/right_hand (see
+openarm_revo2_real_hand_config.py), which additionally streams to
+HAND_TRAJECTORY_COMMAND_TOPICS, expanding each row's recorded index_proximal
+scalar into all 6 real finger joints via compute_hand_finger_positions() --
+same mechanism ros2_gr00t_client.py's publish_command_real uses for live
+inference. Interpolates between consecutive recorded rows and streams at
+--command-hz, same reasoning as ros2_gr00t_client.py's --command-hz: the
+real arm controllers run interpolation_method: none and expect a
+high-frequency command stream, not sparse waypoints at the dataset's native
+--fps.
 
 Runs under ROS2's system Python (rclpy), same as ros2_gr00t_client.py.
 
@@ -48,6 +54,11 @@ Usage:
     python examples/OpenArm/replay_ground_truth.py --mode real \
         --episode-path /home/ws/data/real/lerobot_v2_data_filtered/20260731/001/data/chunk-000/episode_000000.parquet \
         --fps 20
+
+    # real, 16-dim (arms + hand)
+    python examples/OpenArm/replay_ground_truth.py --mode real --with-hand \
+        --episode-path /home/ws/data/real/raw_data/lerobot_v2_data_filtered/20260806/001/data/chunk-000/episode_000000.parquet \
+        --fps 20
 """
 
 import argparse
@@ -58,16 +69,21 @@ import numpy as np
 import pandas as pd
 import rclpy
 from rclpy.node import Node
+from ros2_gr00t_client import (
+    COMMAND_JOINT_GROUPS,
+    HAND_KEYS,
+    HAND_TRAJECTORY_COMMAND_TOPICS,
+    JOINT_COMMAND_TOPIC,
+    NAMES_L_HAND,
+    NAMES_R_HAND,
+    STATE_JOINT_GROUPS,
+    TRAJECTORY_COMMAND_TOPICS,
+    HandDebouncer,
+    compute_hand_finger_positions,
+)
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from ros2_gr00t_client import (
-    COMMAND_JOINT_GROUPS,
-    HandDebouncer,
-    JOINT_COMMAND_TOPIC,
-    STATE_JOINT_GROUPS,
-    TRAJECTORY_COMMAND_TOPICS,
-)
 
 SIM_STATE_KEYS = ["left_arm", "right_arm", "left_hand", "right_hand"]
 REAL_STATE_KEYS = ["left_arm", "right_arm"]
@@ -117,7 +133,11 @@ def stream_real_segment(
     JointTrajectory commands at command_hz -- same streaming pattern as
     ros2_gr00t_client.py's publish_command_real / state_machine.py's
     _stream_segment (interpolation_method: none needs a high-frequency
-    command stream, not sparse waypoints)."""
+    command stream, not sparse waypoints). Arm keys publish the interpolated
+    7-dim value as-is; hand keys (if pubs includes them, i.e. --with-hand)
+    interpolate the recorded 1-dim index_proximal scalar and expand it into
+    all 6 real finger joints via compute_hand_finger_positions() -- same
+    mechanism ros2_gr00t_client.py's publish_command_real uses live."""
     n_substeps = max(1, round(duration_s * command_hz))
     dt = 1.0 / command_hz
     time_from_start = Duration(sec=0, nanosec=int(dt * 1e9))
@@ -125,13 +145,19 @@ def stream_real_segment(
         loop_start = time.perf_counter()
         alpha = sub / n_substeps
         stamp = node.get_clock().now().to_msg()
-        for arm_key, pub in pubs.items():
-            blended = (1.0 - alpha) * start[arm_key] + alpha * end[arm_key]
+        for key, pub in pubs.items():
             msg = JointTrajectory()
             msg.header.stamp = stamp
-            msg.joint_names = STATE_JOINT_GROUPS[arm_key]
+            if key in HAND_KEYS:
+                scalar = float((1.0 - alpha) * start[key][0] + alpha * end[key][0])
+                msg.joint_names = NAMES_L_HAND if key == "left_hand" else NAMES_R_HAND
+                positions = compute_hand_finger_positions(scalar).tolist()
+            else:
+                blended = (1.0 - alpha) * start[key] + alpha * end[key]
+                msg.joint_names = STATE_JOINT_GROUPS[key]
+                positions = blended.tolist()
             point = JointTrajectoryPoint()
-            point.positions = blended.tolist()
+            point.positions = positions
             point.time_from_start = time_from_start
             msg.points = [point]
             pub.publish(msg)
@@ -163,16 +189,24 @@ def run_sim(node: Node, states: np.ndarray, fps: float, loop: bool) -> None:
         hand_debouncers = {"left_hand": HandDebouncer(), "right_hand": HandDebouncer()}
 
 
-def run_real(node: Node, states: np.ndarray, fps: float, command_hz: float, loop: bool) -> None:
+def run_real(
+    node: Node, states: np.ndarray, fps: float, command_hz: float, loop: bool, with_hand: bool
+) -> None:
+    command_topics = dict(TRAJECTORY_COMMAND_TOPICS)
+    state_keys = list(REAL_STATE_KEYS)
+    if with_hand:
+        command_topics.update(HAND_TRAJECTORY_COMMAND_TOPICS)
+        state_keys += list(HAND_KEYS)
+
     pubs = {
         key: node.create_publisher(JointTrajectory, topic, 10)
-        for key, topic in TRAJECTORY_COMMAND_TOPICS.items()
+        for key, topic in command_topics.items()
     }
-    for key, topic in TRAJECTORY_COMMAND_TOPICS.items():
+    for key, topic in command_topics.items():
         print(f"Publishing '{key}' commands to: {topic}")
     time.sleep(0.5)  # let publishers connect before the first command
 
-    rows = [split_state_row(row, REAL_STATE_KEYS) for row in states]
+    rows = [split_state_row(row, state_keys) for row in states]
     segment_duration = 1.0 / fps  # one recorded frame's worth of real time, per segment
 
     while True:
@@ -186,16 +220,35 @@ def run_real(node: Node, states: np.ndarray, fps: float, command_hz: float, loop
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay recorded observation.state directly onto the robot")
-    parser.add_argument("--mode", choices=["sim", "real"], default="sim", help="See module docstring")
-    parser.add_argument("--episode-path", type=str, required=True, help="Path to episode_XXXXXX.parquet")
-    parser.add_argument("--fps", type=float, default=20.0, help="Playback rate (match the dataset's fps)")
+    parser = argparse.ArgumentParser(
+        description="Replay recorded observation.state directly onto the robot"
+    )
     parser.add_argument(
-        "--command-hz", type=float, default=250.0,
+        "--mode", choices=["sim", "real"], default="sim", help="See module docstring"
+    )
+    parser.add_argument(
+        "--episode-path", type=str, required=True, help="Path to episode_XXXXXX.parquet"
+    )
+    parser.add_argument(
+        "--fps", type=float, default=20.0, help="Playback rate (match the dataset's fps)"
+    )
+    parser.add_argument(
+        "--command-hz",
+        type=float,
+        default=250.0,
         help="--mode real only: publish rate for the interpolated command stream "
         "between recorded rows (see ros2_gr00t_client.py's --command-hz).",
     )
-    parser.add_argument("--loop", action="store_true", help="Loop the episode instead of playing once")
+    parser.add_argument(
+        "--with-hand",
+        action="store_true",
+        help="--mode real only: episode is 16-dim (arms + hand, see "
+        "openarm_revo2_real_hand_config.py) instead of the 14-dim arms-only "
+        "default -- also streams hand commands via HAND_TRAJECTORY_COMMAND_TOPICS.",
+    )
+    parser.add_argument(
+        "--loop", action="store_true", help="Loop the episode instead of playing once"
+    )
     args = parser.parse_args()
 
     df = pd.read_parquet(args.episode_path)
@@ -204,11 +257,15 @@ def main() -> None:
         print(f"task_index values in this episode: {sorted(df['task_index'].unique().tolist())}")
 
     states = np.stack(df["observation.state"].to_numpy())
-    expected_dim = 16 if args.mode == "sim" else 14
+    if args.mode == "sim":
+        expected_dim = 16
+    else:
+        expected_dim = 16 if args.with_hand else 14
     if states.shape[1] != expected_dim:
         raise ValueError(
-            f"--mode {args.mode} expects {expected_dim}-dim observation.state, "
-            f"got {states.shape[1]} from {args.episode_path}. Wrong dataset for this mode?"
+            f"--mode {args.mode}{' --with-hand' if args.with_hand else ''} expects "
+            f"{expected_dim}-dim observation.state, got {states.shape[1]} from "
+            f"{args.episode_path}. Wrong dataset, or missing/extra --with-hand?"
         )
 
     rclpy.init()
@@ -217,7 +274,7 @@ def main() -> None:
         if args.mode == "sim":
             run_sim(node, states, args.fps, args.loop)
         else:
-            run_real(node, states, args.fps, args.command_hz, args.loop)
+            run_real(node, states, args.fps, args.command_hz, args.loop, args.with_hand)
     except KeyboardInterrupt:
         pass
     finally:
