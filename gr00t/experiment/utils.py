@@ -209,3 +209,100 @@ class BestMetricCheckpointCallback(TrainerCallback):
                 shutil.rmtree(self._best_checkpoint_dir)
 
             self._best_checkpoint_dir = str(best_checkpoint_dir)
+
+
+class BestTrainLossCheckpointCallback(TrainerCallback):
+    """Save a copy of the model whenever an EMA of the training loss hits a
+    new low. Exists because save_best_eval_metric_name/BestMetricCheckpointCallback
+    need an eval loop (on_evaluate), which sharded datasets don't support
+    (eval_strategy is forced to "no") -- this hooks on_log instead, so it
+    works with training loss alone, no eval set required.
+
+    An EMA, not the raw per-log-step loss, decides "best" -- raw loss is
+    noisy (each logged value is already an average over --logging-steps
+    steps, but that can still swing on a lucky/unlucky batch), so a single
+    low reading isn't a reliable signal that the model genuinely improved.
+    Same save/broadcast/cleanup mechanics as BestMetricCheckpointCallback
+    (single rolling best-checkpoint directory, DDP/ZeRO/FSDP-safe).
+    """
+
+    def __init__(
+        self,
+        trainer: Trainer,
+        *,
+        ema_alpha: float = 0.05,
+        exp_cfg_dir: Path | None = None,
+    ):
+        """
+        Args:
+            trainer: The owning ``Trainer``; needed to call
+                ``trainer.save_model`` (the sharded-aware save path).
+            ema_alpha: EMA smoothing factor applied to the logged "loss" value.
+            exp_cfg_dir: Directory copied alongside each best checkpoint.
+        """
+        self.ema_alpha = ema_alpha
+        self.exp_cfg_dir = exp_cfg_dir
+        self.ema_loss: float | None = None
+        self.best_ema_loss = float("inf")
+        self._best_checkpoint_dir = None
+        self._trainer = trainer
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs=None,
+        **kwargs,
+    ):
+        save_flag = 0
+        metric_value = 0.0
+        if state.is_world_process_zero and logs is not None:
+            current = logs.get("loss", None)  # training loss; eval logs use "eval_loss"
+            if current is not None:
+                self.ema_loss = (
+                    current
+                    if self.ema_loss is None
+                    else self.ema_alpha * current + (1 - self.ema_alpha) * self.ema_loss
+                )
+                if self.ema_loss < self.best_ema_loss:
+                    save_flag = 1
+                    metric_value = self.ema_loss
+
+        save_flag, metric_value = _broadcast_save_decision(save_flag, metric_value)
+        if save_flag == 0:
+            return
+
+        self.best_ema_loss = metric_value
+
+        best_checkpoint_dir = (
+            Path(args.output_dir) / f"checkpoint-{state.global_step}-best-train_loss_{metric_value}"
+        )
+
+        if state.is_world_process_zero:
+            best_checkpoint_dir.mkdir(exist_ok=True)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        self._trainer.save_model(str(best_checkpoint_dir))
+
+        if state.is_world_process_zero:
+            if self.exp_cfg_dir is not None and self.exp_cfg_dir.exists():
+                exp_cfg_dst = best_checkpoint_dir / self.exp_cfg_dir.name
+                logger.info(
+                    "Copying experiment config directory %s to %s",
+                    self.exp_cfg_dir,
+                    exp_cfg_dst,
+                )
+                shutil.copytree(self.exp_cfg_dir, exp_cfg_dst, dirs_exist_ok=True)
+
+            logger.info(
+                "Best-train-loss checkpoint saved to %s with EMA loss = %s",
+                best_checkpoint_dir,
+                metric_value,
+            )
+
+            if self._best_checkpoint_dir is not None and Path(self._best_checkpoint_dir).exists():
+                shutil.rmtree(self._best_checkpoint_dir)
+
+            self._best_checkpoint_dir = str(best_checkpoint_dir)

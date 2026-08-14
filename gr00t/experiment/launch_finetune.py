@@ -124,6 +124,8 @@ if __name__ == "__main__":
     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
 
     config.training.save_only_model = ft_config.save_only_model
+    config.training.save_best_train_loss = ft_config.save_best_train_loss
+    config.training.save_best_train_loss_ema_alpha = ft_config.save_best_train_loss_ema_alpha
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 

@@ -185,6 +185,16 @@ class FinetuneConfig:
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
 
+    save_best_train_loss: bool = False
+    """If True, additionally save a checkpoint (checkpoint-{step}-best-train_loss_{value}/)
+    whenever an EMA of the training loss hits a new low. Unlike save_best_eval_metric_name
+    (unavailable here -- sharded datasets require eval_strategy="no"), this needs no eval set.
+    The EMA (not the raw per-log-step loss) decides "best", to avoid saving on a lucky noisy
+    dip; smoothing factor is save_best_train_loss_ema_alpha."""
+
+    save_best_train_loss_ema_alpha: float = 0.05
+    """EMA smoothing factor for save_best_train_loss (higher = more reactive to recent steps)."""
+
     resume_from_checkpoint: bool = False
     """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. Default
     False so a rerun against an existing ``output_dir`` starts fresh instead of

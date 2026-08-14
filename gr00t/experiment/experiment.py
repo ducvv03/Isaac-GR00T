@@ -33,7 +33,11 @@ from gr00t.experiment.dist_utils import run_on_rank0, run_or_wait_on_rank0
 
 # Use custom trainer that profiles data loading & forward times
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
-from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
+from gr00t.experiment.utils import (
+    BestMetricCheckpointCallback,
+    BestTrainLossCheckpointCallback,
+    CheckpointFormatCallback,
+)
 from gr00t.model import MODEL_REGISTRY
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, save_initial_actions
 
@@ -350,6 +354,15 @@ def run(config: Config):
                 greater_is_better=config.training.save_best_eval_metric_greater_is_better,
                 exp_cfg_dir=save_cfg_dir,
                 trainer=trainer,
+            )
+        )
+
+    if config.training.save_best_train_loss:
+        trainer.add_callback(
+            BestTrainLossCheckpointCallback(
+                trainer=trainer,
+                ema_alpha=config.training.save_best_train_loss_ema_alpha,
+                exp_cfg_dir=save_cfg_dir,
             )
         )
 

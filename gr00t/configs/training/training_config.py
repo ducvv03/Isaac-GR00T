@@ -89,6 +89,11 @@ class TrainingConfig:
     save_best_eval_metric_name: str = ""
     save_best_eval_metric_greater_is_better: bool = True
 
+    # Best-train-loss checkpointing (works with eval_strategy="no", unlike the
+    # save_best_eval_metric_* pair above -- see BestTrainLossCheckpointCallback)
+    save_best_train_loss: bool = False
+    save_best_train_loss_ema_alpha: float = 0.05
+
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)
     gradient_checkpointing: bool = False
