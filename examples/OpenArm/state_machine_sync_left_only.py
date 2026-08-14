@@ -25,11 +25,18 @@ at all, only "head"/"left" cameras (no "right"), single task ("Pick brown box
 and place it into blue bin.", no LIFT/PLACE toggle -- this dataset has no
 task_index switches, see the modality config's docstring).
 
+--start-mode {prepare,direct} (default prepare) chooses whether to run the
+HOME -> PREPARE move before starting inference, or skip it and start
+inference directly from wherever the left arm currently is. The prepare move
+itself (move_to_prepare_left_only()) only ever publishes to left_arm -- even
+though it reads prepare.csv's (possibly bimanual) waypoints via
+state_machine.py's load_prepare_waypoints(), any right_arm columns in that
+file are simply not used, so the right arm (if the physical robot has one)
+is never commanded and stays wherever it currently is.
+
 This file does NOT modify ros2_gr00t_client.py or state_machine.py, and
 reuses state_machine.py's wait_for_enter / check_quit_nonblocking /
-move_to_prepare / DEFAULT_PREPARE_CSV as-is (the HOME->PREPARE move is still
-the bimanual prepare.csv -- it moves both arms if the physical robot has a
-right arm too, but only the left arm is driven by GR00T afterward here).
+load_prepare_waypoints / DEFAULT_PREPARE_CSV as-is.
 Reuses ros2_gr00t_client.py's generic, embodiment-agnostic pieces
 (CAMERA_TOPICS, STATE_JOINT_GROUPS["left_arm"], CONTROLLER_STATE_TOPICS,
 TRAJECTORY_COMMAND_TOPICS, HAND_CONTROLLER_STATE_TOPICS,
@@ -92,7 +99,7 @@ from server_client import PolicyClient
 from state_machine import (
     DEFAULT_PREPARE_CSV,
     check_quit_nonblocking,
-    move_to_prepare,
+    load_prepare_waypoints,
     wait_for_enter,
 )
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -126,6 +133,84 @@ def compute_left_hand_finger_positions(thumb_metacarpal: float, index_proximal: 
         ],
         dtype=np.float64,
     )
+
+
+def _stream_left_arm_segment(
+    pub, node: Node, start: np.ndarray, end: np.ndarray, duration_s: float, command_hz: float
+) -> bool:
+    """Same streaming pattern as state_machine.py's _stream_segment, trimmed
+    to a single left_arm publisher (used by move_to_prepare_left_only() --
+    the right arm, if the physical robot has one, is never published to and
+    stays wherever it currently is). Returns False (stopping mid-segment) if
+    'q' was pressed; True if the segment completed."""
+    n_substeps = max(1, round(duration_s * command_hz))
+    dt = 1.0 / command_hz
+    time_from_start = Duration(sec=0, nanosec=int(dt * 1e9))
+    for sub in range(1, n_substeps + 1):
+        if check_quit_nonblocking():
+            return False
+        loop_start = time.perf_counter()
+        alpha = sub / n_substeps
+        blended = (1.0 - alpha) * start + alpha * end
+        msg = JointTrajectory()
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.joint_names = STATE_JOINT_GROUPS["left_arm"]
+        point = JointTrajectoryPoint()
+        point.positions = blended.tolist()
+        point.time_from_start = time_from_start
+        msg.points = [point]
+        pub.publish(msg)
+        elapsed = time.perf_counter() - loop_start
+        sleep_time = dt - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+    return True
+
+
+def move_to_prepare_left_only(csv_path: Path, duration_s: float, command_hz: float) -> None:
+    """STATE: HOME -> PREPARE, left arm only. Unlike state_machine.py's
+    move_to_prepare (which drives both arms), this publishes ONLY to
+    left_arm -- the right arm, if the physical robot has one, is never
+    commanded and stays exactly wherever it currently is. Reuses
+    state_machine.py's load_prepare_waypoints() (reads prepare.csv's
+    left_arm columns; any right_arm columns in that file are read but simply
+    not used here). Assumes the left arm is at its zero/home pose when this
+    starts. Stops early (holding position) if 'q' is pressed."""
+    waypoints = load_prepare_waypoints(csv_path)
+    if not waypoints:
+        raise RuntimeError(f"No waypoints parsed from {csv_path}")
+    logger.info(
+        "STATE HOME -> PREPARE (left arm only): %d waypoints from %s over %.1fs "
+        "(press 'q' to stop early)",
+        len(waypoints),
+        csv_path,
+        duration_s,
+    )
+
+    home = np.zeros(7, dtype=np.float64)
+    sequence = [home, *(w["left_arm"] for w in waypoints)]
+    segment_duration = duration_s / (len(sequence) - 1)
+
+    rclpy.init()
+    node = Node("openarm_left_only_prepare_move")
+    pub = node.create_publisher(JointTrajectory, TRAJECTORY_COMMAND_TOPICS["left_arm"], 10)
+    time.sleep(0.5)  # let the publisher connect before the first command
+    try:
+        for i in range(len(sequence) - 1):
+            if not _stream_left_arm_segment(
+                pub, node, sequence[i], sequence[i + 1], segment_duration, command_hz
+            ):
+                logger.info(
+                    "STATE HOME -> PREPARE: stopped early by user (q) at waypoint %d/%d",
+                    i,
+                    len(sequence) - 1,
+                )
+                return
+            logger.info("  waypoint %d/%d reached", i + 1, len(sequence) - 1)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+    logger.info("STATE HOME -> PREPARE: done, left arm at prepare position.")
 
 
 class LeftArmGr00tClientNode(Node):
@@ -432,6 +517,15 @@ def main() -> None:
         default=250.0,
         help="Publish rate for the HOME->PREPARE move.",
     )
+    parser.add_argument(
+        "--start-mode",
+        choices=["prepare", "direct"],
+        default="prepare",
+        help="'prepare' (default): move HOME -> PREPARE -- left arm only, the "
+        "right arm (if the physical robot has one) is left untouched -- before "
+        "starting inference. 'direct': skip the prepare move entirely and start "
+        "inference from wherever the left arm currently is.",
+    )
     parser.add_argument("--host", type=str, default="localhost", help="Policy server host")
     parser.add_argument("--port", type=int, default=5555, help="Policy server port")
     parser.add_argument(
@@ -457,9 +551,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not wait_for_enter("\nPress Enter to move HOME -> PREPARE, or 'q' to quit."):
-        return
-    move_to_prepare(args.prepare_csv, args.prepare_duration, args.prepare_command_hz)
+    if args.start_mode == "prepare":
+        if not wait_for_enter(
+            "\nPress Enter to move HOME -> PREPARE (left arm only), or 'q' to quit."
+        ):
+            return
+        move_to_prepare_left_only(args.prepare_csv, args.prepare_duration, args.prepare_command_hz)
+    else:
+        logger.info("STATE: --start-mode=direct -- skipping HOME -> PREPARE move.")
 
     if not wait_for_enter(f"\nPress Enter to start task: {PICK_PLACE_TASK!r}, or 'q' to quit."):
         return
